@@ -1,7 +1,6 @@
 import numpy as np
 
-from openai import AsyncOpenAI, AsyncAzureOpenAI, APIConnectionError, RateLimitError
-from ollama import AsyncClient
+from openai import APIConnectionError, RateLimitError
 from dataclasses import asdict, dataclass, field
 
 from tenacity import (
@@ -21,6 +20,7 @@ global_azure_openai_async_client = None
 global_ollama_client = None
 
 def get_openai_async_client_instance():
+    from openai import AsyncOpenAI
     global global_openai_async_client
     if global_openai_async_client is None:
         global_openai_async_client = AsyncOpenAI()
@@ -28,12 +28,14 @@ def get_openai_async_client_instance():
 
 
 def get_azure_openai_async_client_instance():
+    from openai import AsyncAzureOpenAI
     global global_azure_openai_async_client
     if global_azure_openai_async_client is None:
         global_azure_openai_async_client = AsyncAzureOpenAI()
     return global_azure_openai_async_client
 
 def get_ollama_async_client_instance():
+    from ollama import AsyncClient
     global global_ollama_client
     if global_ollama_client is None:
         # set OLLAMA_HOST or pass in host="http://127.0.0.1:11434"

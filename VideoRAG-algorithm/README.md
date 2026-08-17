@@ -93,14 +93,11 @@ pip install ollama==0.5.3
 Download the necessary checkpoints in **the repository's root folder** for MiniCPM-V, Whisper, and ImageBind:
 
 ```bash
-# Ensure git-lfs is installed
-git lfs install
-
 # Download MiniCPM-V model
-git lfs clone https://huggingface.co/openbmb/MiniCPM-V-2_6-int4
+hf download https://huggingface.co/openbmb/MiniCPM-V-2_6-int4
 
 # Download Whisper model
-git lfs clone https://huggingface.co/Systran/faster-distil-whisper-large-v3
+hf download https://huggingface.co/Systran/faster-distil-whisper-large-v3
 
 # Download ImageBind checkpoint
 mkdir .checkpoints
@@ -109,24 +106,6 @@ wget https://dl.fbaipublicfiles.com/imagebind/imagebind_huge.pth
 cd ../
 ```
 
-### 📁 Directory Structure
-
-Your final directory structure after downloading all checkpoints should look like this:
-
-```shell
-VideoRAG/
-├── .checkpoints/
-├── faster-distil-whisper-large-v3/
-├── LICENSE
-├── longervideos/
-├── MiniCPM-V-2_6-int4/
-├── README.md
-├── reproduce/
-├── notesbooks/
-├── videorag/
-├── VideoRAG_cover.png
-└── VideoRAG.png
-```
 
 ## 🚀 Quick Start
 
