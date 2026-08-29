@@ -65,6 +65,8 @@ conda activate videorag
 Install the essential packages for VideoRAG:
 
 ```bash
+pip install mcp==2
+
 # Core numerical and deep learning libraries
 pip install numpy==1.26.4
 pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2
@@ -72,7 +74,7 @@ pip install accelerate==0.30.1
 pip install bitsandbytes==0.43.1
 
 # Video processing utilities
-pip install moviepy==1.0.3
+pip install moviepy==1.0.3 setuptools==81.0.0
 pip install git+https://github.com/facebookresearch/pytorchvideo.git@28fe037d212663c6a24f373b94cc5d478c8c1a1d
 pip install --no-deps git+https://github.com/facebookresearch/ImageBind.git@3fcf5c9039de97f6ff5528ee4a9dce903c5979b3
 
@@ -85,7 +87,7 @@ pip install ctranslate2==4.4.0 faster_whisper==1.0.3 neo4j hnswlib xxhash nano-v
 # Language models and utilities
 pip install transformers==4.37.1
 pip install tiktoken openai tenacity
-pip install ollama==0.5.3
+pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2%2Bcu12torch2.1cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 ```
 
 ### 📥 Model Checkpoints
