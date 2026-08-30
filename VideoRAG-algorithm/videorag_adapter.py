@@ -229,12 +229,20 @@ async def run_videorag_query(
                         "mode": mode,
                     },
                 )
+                if getattr(result, "isError", False):
+                    details = "; ".join(
+                        str(getattr(item, "text", item)) for item in (result.content or [])
+                    )
+                    raise RuntimeError(f"VideoRAG MCP tool failed: {details}")
                 if result and result.content:
                     for item in result.content:
                         if hasattr(item, "text"):
-                            return item.text
-                        return str(item)
-                return ""
+                            answer = item.text
+                        else:
+                            answer = str(item)
+                        if isinstance(answer, str) and answer.strip():
+                            return answer
+                raise RuntimeError("VideoRAG MCP tool returned no answer")
     except Exception as exc:
         logger.exception("[videorag_adapter] MCP call_tool failed")
-        return ""
+        raise

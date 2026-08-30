@@ -202,7 +202,27 @@ async def _handle_entity_relation_summary(
     use_prompt = prompt_template.format(**context_base)
     logger.debug(f"Trigger summary: {entity_or_relation_name}")
     summary = await use_llm_func(use_prompt, max_tokens=summary_max_tokens)
+    if not isinstance(summary, str) or not summary.strip():
+        logger.warning(
+            "Entity/relation summarization returned empty content for %r; "
+            "using the original description",
+            entity_or_relation_name,
+        )
+        return description
     return summary
+
+
+def _join_valid_descriptions(descriptions: list, owner: object) -> str:
+    """Join descriptions without allowing invalid GraphML attributes."""
+    invalid_types = sorted(
+        {type(value).__name__ for value in descriptions if not isinstance(value, str)}
+    )
+    if invalid_types:
+        raise ValueError(
+            f"Invalid description value for {owner!r}: expected str, got "
+            f"{', '.join(invalid_types)}"
+        )
+    return GRAPH_FIELD_SEP.join(sorted(set(descriptions)))
 
 
 async def _handle_single_entity_extraction(
@@ -274,8 +294,9 @@ async def _merge_nodes_then_upsert(
         key=lambda x: x[1],
         reverse=True,
     )[0][0]
-    description = GRAPH_FIELD_SEP.join(
-        sorted(set([dp["description"] for dp in nodes_data] + already_description))
+    description = _join_valid_descriptions(
+        [dp["description"] for dp in nodes_data] + already_description,
+        entity_name,
     )
     source_id = GRAPH_FIELD_SEP.join(
         set([dp["source_id"] for dp in nodes_data] + already_source_ids)
@@ -319,8 +340,9 @@ async def _merge_edges_then_upsert(
     # [numberchiffre]: `Relationship.order` is only returned from DSPy's predictions
     order = min([dp.get("order", 1) for dp in edges_data] + already_order)
     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
-    description = GRAPH_FIELD_SEP.join(
-        sorted(set([dp["description"] for dp in edges_data] + already_description))
+    description = _join_valid_descriptions(
+        [dp["description"] for dp in edges_data] + already_description,
+        (src_id, tgt_id),
     )
     source_id = GRAPH_FIELD_SEP.join(
         set([dp["source_id"] for dp in edges_data] + already_source_ids)
@@ -577,6 +599,126 @@ async def _extract_keywords_query(
     final_result = await use_llm_func(keywords_prompt)
     return final_result
 
+
+async def _get_retrieved_chunks(text_chunks_db, results: list[dict]) -> list[dict]:
+    """Resolve vector results and fail clearly if the stores diverged."""
+    chunk_ids = [result["id"] for result in results]
+    chunks = await text_chunks_db.get_by_ids(chunk_ids)
+    missing_ids = [
+        chunk_id for chunk_id, chunk in zip(chunk_ids, chunks) if chunk is None
+    ]
+    if missing_ids:
+        preview = ", ".join(missing_ids[:5])
+        suffix = "..." if len(missing_ids) > 5 else ""
+        raise RuntimeError(
+            "VideoRAG storage is inconsistent: "
+            f"{len(missing_ids)} retrieved chunk(s) have no text record "
+            f"({preview}{suffix}). Rebuild the working directory."
+        )
+    return chunks
+
+
+def _normalize_multiple_choice_answer(answer: object) -> str | None:
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+
+    answer = answer.strip()
+    # Normalize the A-D forms used by VideoMME while preserving other label
+    # schemes supported by VideoRAG (for example, numeric labels).
+    letter_match = re.match(r"^[\s`*_#\[(]*([A-D])(?:[\s`*_#\]).,:]|$)", answer, re.I)
+    if letter_match:
+        return letter_match.group(1).upper()
+
+    explicit_match = re.search(
+        r"\b(?:best\s+)?(?:answer|choice)(?:\s+is)?\s*[:=\-]?\s*[\[(]?([A-D])[\])]?(?:\W|$)",
+        answer,
+        re.I,
+    )
+    if explicit_match:
+        return explicit_match.group(1).upper()
+
+    return answer
+
+
+def _multiple_choice_result_from_mapping(result: object) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+
+    raw_answer = result.get("Answer", result.get("answer"))
+    answer = _normalize_multiple_choice_answer(raw_answer)
+    if answer is None:
+        return None
+
+    explanation = result.get("Explanation", result.get("explanation", ""))
+    if not isinstance(explanation, str):
+        explanation = str(explanation) if explanation is not None else ""
+    return {"Answer": answer, "Explanation": explanation}
+
+
+def _parse_multiple_choice_response(response: object) -> dict | None:
+    """Accept VideoRAG JSON and common, unambiguous MC response variants."""
+    if not isinstance(response, str) or not response.strip():
+        return None
+
+    response = response.strip()
+    decoder = json.JSONDecoder()
+
+    # raw_decode from every opening brace handles fenced JSON, leading prose,
+    # and valid JSON followed by extra generated text or another object.
+    for match in re.finditer(r"\{", response):
+        try:
+            candidate, _ = decoder.raw_decode(response[match.start():])
+        except json.JSONDecodeError:
+            continue
+        parsed = _multiple_choice_result_from_mapping(candidate)
+        if parsed is not None:
+            return parsed
+
+    # Recover a labeled answer from JSON-like output with minor syntax errors
+    # (the published VideoRAG prompt itself previously omitted a comma).
+    labeled_match = re.search(
+        r"[\"']?Answer[\"']?\s*:\s*[\"']?\s*([A-D])(?:\W|$)",
+        response,
+        re.I,
+    )
+    if labeled_match:
+        return {"Answer": labeled_match.group(1).upper(), "Explanation": response}
+
+    answer = _normalize_multiple_choice_answer(response)
+    if answer in {"A", "B", "C", "D"}:
+        return {"Answer": answer, "Explanation": ""}
+    return None
+
+
+async def _generate_multiple_choice_response(
+    query: str,
+    system_prompt: str,
+    use_model_func: callable,
+    max_attempts: int,
+) -> dict:
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        response = await use_model_func(
+            query,
+            system_prompt=system_prompt,
+            use_cache=False,
+        )
+        parsed = _parse_multiple_choice_response(response)
+        if parsed is not None:
+            return parsed
+
+        preview = repr(response[:200]) if isinstance(response, str) else repr(response)
+        logger.warning(
+            "Multiple-choice response was not parseable (attempt %d/%d): %s",
+            attempt,
+            max_attempts,
+            preview,
+        )
+
+    raise RuntimeError(
+        f"VLM did not return a parseable multiple-choice answer after {max_attempts} attempts"
+    )
+
 async def videorag_query(
     query,
     entities_vdb,
@@ -598,8 +740,7 @@ async def videorag_query(
     results = await chunks_vdb.query(query, top_k=query_param.top_k)
     if not len(results):
         return PROMPTS["fail_response"]
-    chunks_ids = [r["id"] for r in results]
-    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+    chunks = await _get_retrieved_chunks(text_chunks_db, results)
 
     maybe_trun_chunks = truncate_list_by_token_size(
         chunks,
@@ -767,8 +908,7 @@ async def videorag_query_multiple_choice(
     results = await chunks_vdb.query(query, top_k=query_param.top_k)
     # NOTE: I update here, not len results can also process
     if len(results):
-        chunks_ids = [r["id"] for r in results]
-        chunks = await text_chunks_db.get_by_ids(chunks_ids)
+        chunks = await _get_retrieved_chunks(text_chunks_db, results)
 
         maybe_trun_chunks = truncate_list_by_token_size(
             chunks,
@@ -906,21 +1046,9 @@ async def videorag_query_multiple_choice(
         chunk_data=retreived_chunk_context,
         response_type=query_param.response_type
     )
-    response = await use_model_func(
+    return await _generate_multiple_choice_response(
         query,
-        system_prompt=sys_prompt,
-        use_cache=False,
+        sys_prompt,
+        use_model_func,
+        global_config.get("multiple_choice_response_max_attempts", 3),
     )
-    while True:
-        try:
-            json_response = json.loads(response)
-            assert "Answer" in json_response and "Explanation" in json_response
-            return json_response
-        except Exception as e:
-            logger.info(f"Response is not valid JSON for query {query}. Found {e}. Retrying...")
-            response = await use_model_func(
-                query,
-                system_prompt=sys_prompt,
-                use_cache=False,
-            )
-    

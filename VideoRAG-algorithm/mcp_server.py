@@ -20,6 +20,20 @@ Environment variables read at startup
     VIDEORAG_CUDA_DEVICE        CUDA visible device(s) for VideoRAG models
     VIDEORAG_HOST               Host to listen on (default: 127.0.0.1)
     VIDEORAG_PORT               Port to listen on (default: 9003)
+    VIDEORAG_EMPTY_RESPONSE_MAX_ATTEMPTS
+                                Attempts before an empty VLM response is fatal
+                                (default: 3)
+    VIDEORAG_STRUCTURED_ENABLE_THINKING
+                                Enable Qwen thinking for structured RAG stages
+                                such as extraction and summarization (default: false)
+    VIDEORAG_FINAL_ENABLE_THINKING
+                                Enable Qwen thinking for final answers (default: true)
+    VIDEORAG_FINAL_THINKING_TOKEN_BUDGET
+                                Maximum Qwen reasoning tokens for final answers
+                                (default: 1024)
+    VIDEORAG_MC_RESPONSE_MAX_ATTEMPTS
+                                Attempts to obtain a parseable final MC answer
+                                (default: 3)
 """
 
 from __future__ import annotations
@@ -61,6 +75,23 @@ _default_mode = os.environ.get("VIDEORAG_QUERY_MODE", "videorag_multiple_choice"
 _load_caption = os.environ.get("VIDEORAG_LOAD_CAPTION", "true").lower() in ("true", "1", "yes")
 _host = os.environ.get("VIDEORAG_HOST", "127.0.0.1")
 _port = int(os.environ.get("VIDEORAG_PORT", "9003"))
+_empty_response_max_attempts = max(
+    1, int(os.environ.get("VIDEORAG_EMPTY_RESPONSE_MAX_ATTEMPTS", "3"))
+)
+_structured_enable_thinking = os.environ.get(
+    "VIDEORAG_STRUCTURED_ENABLE_THINKING", "false"
+).lower() in ("true", "1", "yes")
+_final_enable_thinking = os.environ.get(
+    "VIDEORAG_FINAL_ENABLE_THINKING", "true"
+).lower() in ("true", "1", "yes")
+_final_thinking_token_budget = int(
+    os.environ.get("VIDEORAG_FINAL_THINKING_TOKEN_BUDGET", "1024")
+)
+if _final_thinking_token_budget < 0:
+    raise ValueError("VIDEORAG_FINAL_THINKING_TOKEN_BUDGET must be non-negative")
+_mc_response_max_attempts = max(
+    1, int(os.environ.get("VIDEORAG_MC_RESPONSE_MAX_ATTEMPTS", "3"))
+)
 
 # Add VideoRAG repository root to sys.path
 _repo_dir = os.path.dirname(os.path.abspath(__file__))
@@ -79,7 +110,8 @@ from videorag.videorag import VideoRAG
 # ---------------------------------------------------------------------------
 _vlm_client = AsyncOpenAI(api_key=_api_key, base_url=_base_url)
 _embed_client = AsyncOpenAI(api_key=_api_key, base_url=_embed_base_url)
-_insert_lock = threading.Lock()
+_pipeline_lock = threading.Lock()
+_fatal_pipeline_error: str | None = None
 
 
 async def _vllm_complete(
@@ -88,7 +120,7 @@ async def _vllm_complete(
     system_prompt: str | None = None,
     history_messages: list | None = None,
     **kwargs,
-) -> str:
+) -> str | None:
     hashing_kv: BaseKVStorage = kwargs.pop("hashing_kv", None)
     use_cache = kwargs.pop("use_cache", True)
 
@@ -102,18 +134,63 @@ async def _vllm_complete(
     if hashing_kv is not None and use_cache:
         args_hash = compute_args_hash(model_name, messages)
         if_cache_return = await hashing_kv.get_by_id(args_hash)
-        if if_cache_return is not None and if_cache_return.get("return") is not None:
-            return if_cache_return["return"]
+        if if_cache_return is not None:
+            cached_content = if_cache_return.get("return")
+            if isinstance(cached_content, str) and cached_content.strip():
+                return cached_content
+            logger.warning("Ignoring an empty cached VLM response for model=%r", model_name)
 
     api_kwargs = {}
     for k in ("temperature", "max_tokens", "top_p", "stop"):
         if k in kwargs:
             api_kwargs[k] = kwargs[k]
+    # VideoRAG's final answer calls have a system prompt; its structured helper
+    # calls (extraction, rewriting, filtering, and summarization) do not. Keep
+    # thinking out of the structured stages so their parsers receive an answer,
+    # and put an explicit upper bound on final-answer reasoning.
+    if "qwen3" in model_name.lower():
+        is_final_answer = system_prompt is not None
+        enable_thinking = (
+            _final_enable_thinking
+            if is_final_answer
+            else _structured_enable_thinking
+        )
+        extra_body = {
+            "chat_template_kwargs": {
+                "enable_thinking": enable_thinking,
+            }
+        }
+        if is_final_answer and enable_thinking:
+            extra_body["thinking_token_budget"] = _final_thinking_token_budget
+        api_kwargs["extra_body"] = extra_body
 
-    response = await _vlm_client.chat.completions.create(
-        model=model_name, messages=messages, **api_kwargs
-    )
-    content = response.choices[0].message.content
+    content = None
+    for attempt in range(1, _empty_response_max_attempts + 1):
+        response = await _vlm_client.chat.completions.create(
+            model=model_name, messages=messages, **api_kwargs
+        )
+        content = response.choices[0].message.content
+        if isinstance(content, str) and content.strip():
+            break
+
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        logger.warning(
+            "VLM returned empty content for model=%r (attempt %d/%d, finish_reason=%r)",
+            model_name,
+            attempt,
+            _empty_response_max_attempts,
+            finish_reason,
+        )
+        if attempt < _empty_response_max_attempts:
+            await asyncio.sleep(min(0.5 * attempt, 2.0))
+    else:
+        logger.error(
+            "VLM returned empty content after %d attempts for model=%r; "
+            "returning no content to the caller's context-specific validator",
+            _empty_response_max_attempts,
+            model_name,
+        )
+        return None
 
     if hashing_kv is not None and use_cache:
         await hashing_kv.upsert(
@@ -166,6 +243,7 @@ def get_videorag() -> VideoRAG:
         working_dir=_working_dir,
         video_segment_length=_segment_length,
         segment_retrieval_top_k=_retrieval_topk,
+        multiple_choice_response_max_attempts=_mc_response_max_attempts,
     )
 
     if _load_caption:
@@ -205,39 +283,62 @@ async def run_videorag_query(
     video_name = os.path.basename(video_path).split(".")[0]
     vr = get_videorag()
 
-    def _sync_process():
+    def _configure_decord():
         try:
             import decord
             decord.bridge.set_bridge("torch")
         except Exception:
             pass
 
-        # Step 1: Insert video if not already ingested (thread-safe)
+    def _insert_video_if_needed():
         if video_name not in vr.video_segments._data:
-            with _insert_lock:
-                if video_name not in vr.video_segments._data:
-                    cache_dir = os.path.join(vr.working_dir, "_cache", video_name)
-                    if os.path.exists(cache_dir):
-                        try:
-                            shutil.rmtree(cache_dir)
-                        except Exception:
-                            pass
-                    logger.info(f"Inserting video: {video_path}")
-                    vr.insert_video(video_path_list=[video_path])
-                else:
-                    logger.info(f"Video already ingested: {video_name}")
+            cache_dir = os.path.join(vr.working_dir, "_cache", video_name)
+            if os.path.exists(cache_dir):
+                try:
+                    shutil.rmtree(cache_dir)
+                except Exception:
+                    pass
+            logger.info(f"Inserting video: {video_path}")
+            vr.insert_video(video_path_list=[video_path])
         else:
             logger.info(f"Video already ingested: {video_name}")
 
-        # Step 2: Query
+    def _query_video():
         param = QueryParam(mode=query_mode)
         param.wo_reference = True
 
         response = vr.query(query=question, param=param)
 
         if isinstance(response, dict):
-            return str(response.get("Answer", ""))
-        return str(response) if response else ""
+            answer = response.get("Answer")
+        else:
+            answer = response
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("VideoRAG returned an empty answer")
+        return answer
+
+    def _sync_process():
+        global _fatal_pipeline_error
+        # VideoRAG's in-memory graph and JSON/vector stores are shared mutable
+        # state. Keep insertion and querying in one critical section so a query
+        # cannot observe a partially inserted video.
+        with _pipeline_lock:
+            _configure_decord()
+            if _fatal_pipeline_error is not None:
+                raise RuntimeError(
+                    "VideoRAG pipeline is halted after an earlier failure; restart "
+                    f"the MCP server. Original failure: {_fatal_pipeline_error}"
+                )
+            try:
+                _insert_video_if_needed()
+            except Exception as exc:
+                # Insertion mutates several shared stores, so an unexpected
+                # insertion failure may leave in-memory state unsafe to reuse.
+                _fatal_pipeline_error = f"{type(exc).__name__}: {exc}"
+                raise
+            # Query/answer-format failures do not mutate the index. Let the
+            # evaluator retry or fail this sample without poisoning later ones.
+            return _query_video()
 
     loop = asyncio.get_running_loop()
     try:
@@ -245,7 +346,7 @@ async def run_videorag_query(
         return answer
     except Exception as exc:
         logger.exception("run_videorag_query failed")
-        return ""
+        raise
 
 
 if __name__ == "__main__":

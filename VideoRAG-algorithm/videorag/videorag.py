@@ -76,6 +76,7 @@ class VideoRAG:
     # query
     retrieval_topk_chunks: int = 2
     query_better_than_threshold: float = 0.2
+    multiple_choice_response_max_attempts: int = 3
     
     # graph mode
     enable_local: bool = True
@@ -201,6 +202,7 @@ class VideoRAG:
 
     def insert_video(self, video_path_list=None):
         loop = always_get_an_event_loop()
+        new_video_segments = {}
         for video_path in video_path_list:
             # Step0: check the existence
             video_name = os.path.basename(video_path).split('.')[0]
@@ -282,6 +284,7 @@ class VideoRAG:
             loop.run_until_complete(self.video_segments.upsert(
                 {video_name: segments_information}
             ))
+            new_video_segments[video_name] = segments_information
             
             # Step5: encode video segment features
             loop.run_until_complete(self.video_segment_feature_vdb.upsert(
@@ -295,10 +298,11 @@ class VideoRAG:
             if os.path.exists(video_segment_cache_path):
                 shutil.rmtree(video_segment_cache_path)
             
-            # Step 7: saving current video information
-            loop.run_until_complete(self._save_video_segments())
-        
-        loop.run_until_complete(self.ainsert(self.video_segments._data))
+        # Persist video metadata/features together with text and graph indexes.
+        # If indexing fails, a restarted process must not treat the video as a
+        # completed insertion.
+        if new_video_segments:
+            loop.run_until_complete(self.ainsert(new_video_segments))
 
     def query(self, query: str, param: QueryParam = QueryParam()):
         loop = always_get_an_event_loop()
@@ -358,6 +362,7 @@ class VideoRAG:
             }
             if not len(inserting_chunks):
                 logger.warning(f"All chunks are already in the storage")
+                await self._insert_done()
                 return
             logger.info(f"[New Chunks] inserting {len(inserting_chunks)} chunks")
             if self.enable_naive_rag:
@@ -369,19 +374,23 @@ class VideoRAG:
 
             # ---------- extract/summary entity and upsert to graph
             logger.info("[Entity Extraction]...")
-            maybe_new_kg, _, _ = await self.entity_extraction_func(
+            extraction_result = await self.entity_extraction_func(
                 inserting_chunks,
                 knowledge_graph_inst=self.chunk_entity_relation_graph,
                 entity_vdb=self.entities_vdb,
                 global_config=asdict(self),
             )
-            if maybe_new_kg is None:
+            if extraction_result is None:
                 logger.warning("No new entities found")
-                return
-            self.chunk_entity_relation_graph = maybe_new_kg
+            else:
+                maybe_new_kg, _, _ = extraction_result
+                self.chunk_entity_relation_graph = maybe_new_kg
             # ---------- commit upsertings and indexing
             await self.text_chunks.upsert(inserting_chunks)
-        finally:
+        except Exception:
+            logger.exception("VideoRAG insertion failed; partial indexes were not persisted")
+            raise
+        else:
             await self._insert_done()
 
     async def _insert_start(self):

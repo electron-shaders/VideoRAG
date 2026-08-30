@@ -1,6 +1,7 @@
 import html
 import json
 import os
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Union, cast
@@ -28,7 +29,18 @@ class NetworkXStorage(BaseGraphStorage):
         logger.info(
             f"Writing graph with {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
         )
-        nx.write_graphml(graph, file_name)
+        directory = os.path.dirname(os.path.abspath(file_name))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary_file = tempfile.mkstemp(
+            prefix=f".{os.path.basename(file_name)}.", suffix=".tmp", dir=directory
+        )
+        os.close(fd)
+        try:
+            nx.write_graphml(graph, temporary_file)
+            os.replace(temporary_file, file_name)
+        finally:
+            if os.path.exists(temporary_file):
+                os.unlink(temporary_file)
 
     @staticmethod
     def stable_largest_connected_component(graph: nx.Graph) -> nx.Graph:
