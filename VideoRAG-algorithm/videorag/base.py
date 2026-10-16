@@ -13,6 +13,10 @@ class QueryParam:
     response_type: str = "Multiple Paragraphs"
     level: int = 2
     top_k: int = 20
+    # Applied only to final generation, not extraction or retrieval helpers.
+    generation_kwargs: dict = field(default_factory=dict)
+    # Evaluation owns answer parsing/grading; keep the model's text unchanged.
+    return_raw_response: bool = False
     # naive search
     naive_max_token_for_text_unit = 12000
     # videorag search

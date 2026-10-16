@@ -695,14 +695,33 @@ async def _generate_multiple_choice_response(
     system_prompt: str,
     use_model_func: callable,
     max_attempts: int,
-) -> dict:
+    generation_kwargs: dict | None = None,
+    return_raw_response: bool = False,
+) -> dict | str:
     max_attempts = max(1, int(max_attempts))
     for attempt in range(1, max_attempts + 1):
         response = await use_model_func(
             query,
             system_prompt=system_prompt,
             use_cache=False,
+            **(generation_kwargs or {}),
         )
+        if return_raw_response:
+            # lmms-eval must see the original answer, including invalid/empty
+            # output. Parsing here is diagnostic only, never a grading gate or
+            # a reason to regenerate an otherwise completed response.
+            try:
+                parsed = _parse_multiple_choice_response(response)
+            except Exception:
+                logger.warning("Diagnostic MC parsing failed; returning raw response", exc_info=True)
+                parsed = None
+            if parsed is None:
+                logger.warning(
+                    "Multiple-choice response was not parseable; passing raw response to evaluator: %r",
+                    response[:200] if isinstance(response, str) else response,
+                )
+            return response if isinstance(response, str) else ""
+
         parsed = _parse_multiple_choice_response(response)
         if parsed is not None:
             return parsed
@@ -881,6 +900,8 @@ async def videorag_query(
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
+        use_cache=False,
+        **query_param.generation_kwargs,
     )
     return response
 
@@ -1051,4 +1072,6 @@ async def videorag_query_multiple_choice(
         sys_prompt,
         use_model_func,
         global_config.get("multiple_choice_response_max_attempts", 3),
+        generation_kwargs=query_param.generation_kwargs,
+        return_raw_response=query_param.return_raw_response,
     )

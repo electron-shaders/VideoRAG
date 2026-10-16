@@ -22,6 +22,7 @@ from typing import Optional
 import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from videorag_errors import FATAL_ERROR_PREFIX, FatalVideoRAGError, find_fatal_error
 
 logger = logging.getLogger("videorag_adapter")
 
@@ -53,6 +54,14 @@ def _cleanup_server():
 
 
 atexit.register(_cleanup_server)
+
+
+def _check_server_alive():
+    """An owned server exiting is not a transient, per-video tool failure."""
+    if _server_proc is not None:
+        status = _server_proc.poll()
+        if status is not None:
+            raise FatalVideoRAGError(f"VideoRAG MCP server exited with status {status}; aborting evaluation")
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +216,8 @@ async def run_videorag_query(
     video_path: str,
     question: str,
     mode: str = "videorag_multiple_choice",
+    generation_kwargs: dict | None = None,
+    return_raw_response: bool = False,
     **kwargs,
 ) -> str:
     """
@@ -218,6 +229,7 @@ async def run_videorag_query(
         )
 
     try:
+        _check_server_alive()
         async with sse_client(f"{_mcp_url}/sse") as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
@@ -227,12 +239,17 @@ async def run_videorag_query(
                         "video_path": video_path,
                         "question": question,
                         "mode": mode,
+                        "generation_kwargs": dict(generation_kwargs or {}),
+                        "return_raw_response": return_raw_response,
                     },
                 )
-                if getattr(result, "isError", False):
+                # MCP 2.x uses snake_case Python fields; 1.x used wire names.
+                if getattr(result, "is_error", False) or getattr(result, "isError", False):
                     details = "; ".join(
                         str(getattr(item, "text", item)) for item in (result.content or [])
                     )
+                    if FATAL_ERROR_PREFIX in details:
+                        raise FatalVideoRAGError(f"VideoRAG MCP pipeline failed fatally: {details}")
                     raise RuntimeError(f"VideoRAG MCP tool failed: {details}")
                 if result and result.content:
                     for item in result.content:
@@ -240,9 +257,16 @@ async def run_videorag_query(
                             answer = item.text
                         else:
                             answer = str(item)
-                        if isinstance(answer, str) and answer.strip():
+                        if isinstance(answer, str) and (return_raw_response or answer.strip()):
                             return answer
+                if return_raw_response:
+                    # MCP may encode an empty string as an empty content list.
+                    return ""
                 raise RuntimeError("VideoRAG MCP tool returned no answer")
     except Exception as exc:
         logger.exception("[videorag_adapter] MCP call_tool failed")
+        fatal = find_fatal_error(exc)
+        if fatal is not None and fatal is not exc:
+            raise FatalVideoRAGError(str(fatal)) from exc
+        _check_server_alive()
         raise

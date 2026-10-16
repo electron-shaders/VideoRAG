@@ -3,8 +3,9 @@ import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
 from moviepy.video.io.VideoFileClip import VideoFileClip
+
+from .._caption_model import load_caption_model
 
 def encode_video(video, frame_times):
     frames = []
@@ -14,11 +15,9 @@ def encode_video(video, frame_times):
     frames = [Image.fromarray(v.astype('uint8')).resize((1280, 720)) for v in frames]
     return frames
     
-def segment_caption(video_name, video_path, segment_index2name, transcripts, segment_times_info, caption_result, error_queue):
+def segment_caption(video_name, video_path, segment_index2name, transcripts, segment_times_info, caption_result, error_queue, caption_model_path=None):
     try:
-        model = AutoModel.from_pretrained('openbmb/MiniCPM-V-2_6-int4', trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained('openbmb/MiniCPM-V-2_6-int4', trust_remote_code=True)
-        model.eval()
+        model, tokenizer = load_caption_model(caption_model_path)
         
         with VideoFileClip(video_path) as video:
             for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
@@ -40,7 +39,7 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
                 torch.cuda.empty_cache()
     except Exception as e:
         error_queue.put(f"Error in segment_caption:\n {str(e)}")
-        raise RuntimeError
+        raise RuntimeError(f"MiniCPM segment captioning failed for {video_name}: {e}") from e
 
 def merge_segment_information(segment_index2name, segment_times_info, transcripts, captions):
     inserting_segments = {}

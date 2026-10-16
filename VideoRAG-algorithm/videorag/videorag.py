@@ -4,11 +4,11 @@ import json
 import shutil
 import asyncio
 import multiprocessing
+from multiprocessing.managers import SyncManager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
 from typing import Callable, Dict, List, Optional, Type, Union, cast
-from transformers import AutoModel, AutoTokenizer
 import tiktoken
 
 
@@ -31,6 +31,9 @@ from ._storage import (
     NanoVectorDBVideoSegmentStorage,
     NetworkXStorage,
 )
+from ._workers import run_video_workers
+from ._caption_model import load_caption_model, resolve_caption_snapshot
+from ._recovery import UnsafeVideoRAGState
 from ._utils import (
     EmbeddingFunc,
     compute_mdhash_id,
@@ -72,6 +75,7 @@ class VideoRAG:
     video_embedding_batch_num: int = 2
     segment_retrieval_top_k: int = 4
     video_embedding_dim: int = 1024
+    caption_model_path: Optional[str] = None
     
     # query
     retrieval_topk_chunks: int = 2
@@ -122,9 +126,8 @@ class VideoRAG:
     def load_caption_model(self, debug=False):
         # caption model
         if not debug:
-            self.caption_model = AutoModel.from_pretrained('openbmb/MiniCPM-V-2_6-int4', trust_remote_code=True)
-            self.caption_tokenizer = AutoTokenizer.from_pretrained('openbmb/MiniCPM-V-2_6-int4', trust_remote_code=True)
-            self.caption_model.eval()
+            self.caption_model_path = resolve_caption_snapshot(self.caption_model_path)
+            self.caption_model, self.caption_tokenizer = load_caption_model(self.caption_model_path)
         else:
             self.caption_model = None
             self.caption_tokenizer = None
@@ -231,56 +234,57 @@ class VideoRAG:
             )
             
             # Step3: saving video segments **as well as** obtain caption with vision language model
-            manager = multiprocessing.Manager()
-            captions = manager.dict()
-            error_queue = manager.Queue()
-            
-            process_saving_video_segments = multiprocessing.Process(
-                target=saving_video_segments,
-                args=(
-                    video_name,
-                    video_path,
-                    self.working_dir,
+            ctx = multiprocessing.get_context("spawn")
+            # Keep manager IPC off shared TMPDIR filesystems: Unix-socket
+            # cleanup can leave busy .__dpc/.nfs entries during shutdown.
+            # Loopback + port 0 stays on this node and needs no fixed port.
+            with SyncManager(address=("127.0.0.1", 0), ctx=ctx, shutdown_timeout=5.0) as manager:
+                captions = manager.dict()
+                error_queue = manager.Queue()
+                workers = [
+                    ctx.Process(
+                        name="videorag-save-segments",
+                        target=saving_video_segments,
+                        args=(
+                            video_name,
+                            video_path,
+                            self.working_dir,
+                            segment_index2name,
+                            segment_times_info,
+                            error_queue,
+                            self.video_output_format,
+                        ),
+                    ),
+                    ctx.Process(
+                        name="videorag-caption-segments",
+                        target=segment_caption,
+                        args=(
+                            video_name,
+                            video_path,
+                            segment_index2name,
+                            transcripts,
+                            segment_times_info,
+                            captions,
+                            error_queue,
+                            self.caption_model_path,
+                        ),
+                    ),
+                ]
+                try:
+                    run_video_workers(workers, error_queue)
+                except Exception as exc:
+                    with open('error_log_videorag.txt', 'a', encoding='utf-8') as log_file:
+                        log_file.write(f"Video Name:{video_name} Error processing:\n{exc}\n\n")
+                    raise
+
+                # Step4: detach results before the manager shuts down. Worker
+                # cleanup finishes inside run_video_workers, even on failure.
+                segments_information = merge_segment_information(
                     segment_index2name,
                     segment_times_info,
-                    error_queue,
-                    self.video_output_format,
-                )
-            )
-            
-            process_segment_caption = multiprocessing.Process(
-                target=segment_caption,
-                args=(
-                    video_name,
-                    video_path,
-                    segment_index2name,
                     transcripts,
-                    segment_times_info,
-                    captions,
-                    error_queue,
+                    dict(captions),
                 )
-            )
-            
-            process_saving_video_segments.start()
-            process_segment_caption.start()
-            process_saving_video_segments.join()
-            process_segment_caption.join()
-            
-            # if raise error in this two, stop the processing
-            while not error_queue.empty():
-                error_message = error_queue.get()
-                with open('error_log_videorag.txt', 'a', encoding='utf-8') as log_file:
-                    log_file.write(f"Video Name:{video_name} Error processing:\n{error_message}\n\n")
-                raise RuntimeError(error_message)
-            
-            # Step4: insert video segments information
-            segments_information = merge_segment_information(
-                segment_index2name,
-                segment_times_info,
-                transcripts,
-                captions,
-            )
-            manager.shutdown()
             loop.run_until_complete(self.video_segments.upsert(
                 {video_name: segments_information}
             ))
@@ -388,7 +392,7 @@ class VideoRAG:
             # ---------- commit upsertings and indexing
             await self.text_chunks.upsert(inserting_chunks)
         except Exception:
-            logger.exception("VideoRAG insertion failed; partial indexes were not persisted")
+            logger.exception("VideoRAG insertion failed")
             raise
         else:
             await self._insert_done()
@@ -430,7 +434,16 @@ class VideoRAG:
             if storage_inst is None:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+        # These files are committed separately, not in a multi-file transaction.
+        # If any save fails, reloading may mix old and new indexes. Do not allow
+        # automatic recovery in that case. Wait for every save before returning.
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException as exc:
+            raise UnsafeVideoRAGState("VideoRAG index commit was interrupted; persisted state must be checked") from exc
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise UnsafeVideoRAGState("VideoRAG index commit failed; persisted state must be checked") from errors[0]
 
     async def _query_done(self):
         tasks = []

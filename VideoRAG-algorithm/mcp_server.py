@@ -17,6 +17,8 @@ Environment variables read at startup
     VIDEORAG_RETRIEVAL_TOPK     Number of retrieved segments (default: 4)
     VIDEORAG_QUERY_MODE         Query mode: "videorag" or "videorag_multiple_choice"
     VIDEORAG_LOAD_CAPTION       Whether to load real caption model (default: "true")
+    VIDEORAG_CAPTION_MODEL_PATH Optional existing MiniCPM snapshot directory;
+                                otherwise use the local Hugging Face cache only
     VIDEORAG_CUDA_DEVICE        CUDA visible device(s) for VideoRAG models
     VIDEORAG_HOST               Host to listen on (default: 127.0.0.1)
     VIDEORAG_PORT               Port to listen on (default: 9003)
@@ -33,7 +35,11 @@ Environment variables read at startup
                                 (default: 1024)
     VIDEORAG_MC_RESPONSE_MAX_ATTEMPTS
                                 Attempts to obtain a parseable final MC answer
-                                (default: 3)
+                                outside raw-response evaluation mode (default: 3)
+    VIDEORAG_TRUNCATION_MAX_TOKENS
+                                Hard output-token cap for length retries (default:
+                                16384). Budgets double on truncation; calls without
+                                an explicit budget start at min(4096, cap).
 """
 
 from __future__ import annotations
@@ -92,6 +98,9 @@ if _final_thinking_token_budget < 0:
 _mc_response_max_attempts = max(
     1, int(os.environ.get("VIDEORAG_MC_RESPONSE_MAX_ATTEMPTS", "3"))
 )
+_truncation_max_tokens = int(os.environ.get("VIDEORAG_TRUNCATION_MAX_TOKENS", "16384"))
+if _truncation_max_tokens < 1:
+    raise ValueError("VIDEORAG_TRUNCATION_MAX_TOKENS must be a positive integer")
 
 # Add VideoRAG repository root to sys.path
 _repo_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,9 +108,13 @@ if _repo_dir not in sys.path:
     sys.path.insert(0, _repo_dir)
 
 from mcp.server import MCPServer
-from openai import AsyncOpenAI
+from mcp.server.mcpserver.exceptions import ToolError
+from openai import AsyncOpenAI, BadRequestError
+from videorag_errors import FATAL_ERROR_PREFIX
+from videorag_sampling import qwen35_sampling_params
 from videorag._llm import LLMConfig
-from videorag._utils import compute_args_hash
+from videorag._utils import always_get_an_event_loop, compute_args_hash
+from videorag._recovery import UnsafeVideoRAGState, drain_pipeline_tasks
 from videorag.base import BaseKVStorage, QueryParam
 from videorag.videorag import VideoRAG
 
@@ -131,19 +144,21 @@ async def _vllm_complete(
         messages.extend(history_messages)
     messages.append({"role": "user", "content": prompt})
 
-    if hashing_kv is not None and use_cache:
-        args_hash = compute_args_hash(model_name, messages)
-        if_cache_return = await hashing_kv.get_by_id(args_hash)
-        if if_cache_return is not None:
-            cached_content = if_cache_return.get("return")
-            if isinstance(cached_content, str) and cached_content.strip():
-                return cached_content
-            logger.warning("Ignoring an empty cached VLM response for model=%r", model_name)
-
     api_kwargs = {}
     for k in ("temperature", "max_tokens", "top_p", "stop"):
         if k in kwargs:
             api_kwargs[k] = kwargs[k]
+    if "max_new_tokens" in kwargs:
+        api_kwargs["max_tokens"] = int(kwargs["max_new_tokens"])
+    initial_budget = int(api_kwargs.get("max_tokens", 4096))
+    if initial_budget < 1:
+        raise ValueError("max_new_tokens/max_tokens must be a positive integer")
+    api_kwargs["max_tokens"] = min(initial_budget, _truncation_max_tokens)
+    if initial_budget > _truncation_max_tokens:
+        logger.warning(
+            "Clamping VLM max_tokens=%d to VIDEORAG_TRUNCATION_MAX_TOKENS=%d",
+            initial_budget, _truncation_max_tokens,
+        )
     # VideoRAG's final answer calls have a system prompt; its structured helper
     # calls (extraction, rewriting, filtering, and summarization) do not. Keep
     # thinking out of the structured stages so their parsers receive an answer,
@@ -155,42 +170,96 @@ async def _vllm_complete(
             if is_final_answer
             else _structured_enable_thinking
         )
-        extra_body = {
-            "chat_template_kwargs": {
-                "enable_thinking": enable_thinking,
-            }
-        }
+        sampling = qwen35_sampling_params(model_name, enable_thinking=enable_thinking)
+        extra_body = dict(kwargs.get("extra_body") or {}) if sampling else {}
+        template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = enable_thinking
+        extra_body["chat_template_kwargs"] = template_kwargs
+        # Task defaults (including VideoMME's greedy decoding) and extra_body
+        # must not override the official preset at the actual API boundary.
+        for name, value in sampling.items():
+            extra_body.pop(name, None)
+            if name in ("temperature", "top_p", "presence_penalty"):
+                api_kwargs[name] = value
+            else:
+                extra_body[name] = value
         if is_final_answer and enable_thinking:
-            extra_body["thinking_token_budget"] = _final_thinking_token_budget
+            extra_body["thinking_token_budget"] = kwargs.get("thinking_token_budget", _final_thinking_token_budget)
         api_kwargs["extra_body"] = extra_body
 
-    content = None
-    for attempt in range(1, _empty_response_max_attempts + 1):
-        response = await _vlm_client.chat.completions.create(
-            model=model_name, messages=messages, **api_kwargs
+    if hashing_kv is not None and use_cache:
+        # Qwen's old cache keys omitted sampling and thinking mode. Include the
+        # effective request so a previous greedy answer cannot bypass this fix.
+        args_hash = (
+            compute_args_hash(model_name, messages, api_kwargs)
+            if qwen35_sampling_params(model_name)
+            else compute_args_hash(model_name, messages)
         )
+        if_cache_return = await hashing_kv.get_by_id(args_hash)
+        if if_cache_return is not None:
+            cached_content = if_cache_return.get("return")
+            if isinstance(cached_content, str) and cached_content.strip():
+                return cached_content
+            logger.warning("Ignoring an empty cached VLM response for model=%r", model_name)
+
+    content = None
+    empty_attempts = 0
+    retrying_truncation = False
+    while True:
+        try:
+            response = await _vlm_client.chat.completions.create(
+                model=model_name, messages=messages, **api_kwargs
+            )
+        except BadRequestError as exc:
+            # A larger output budget can exceed the model's remaining context
+            # window. Keep the previous answer instead of losing it to a retry.
+            context_error = any(
+                marker in str(exc).lower()
+                for marker in ("maximum context length", "max_model_len", "context window")
+            )
+            if not retrying_truncation or not context_error:
+                raise
+            logger.warning("Truncation retry exceeds model context; returning last response: %s", exc)
+            return content
         content = response.choices[0].message.content
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason == "length":
+            budget = api_kwargs["max_tokens"]
+            next_budget = min(budget * 2, _truncation_max_tokens)
+            usage = getattr(response, "usage", None)
+            logger.warning(
+                "VLM response truncated (finish_reason=length, max_tokens=%d, completion_tokens=%s); %s",
+                budget, getattr(usage, "completion_tokens", None),
+                f"retrying with max_tokens={next_budget}"
+                if next_budget > budget else "token cap reached; returning last response without caching",
+            )
+            if next_budget <= budget:
+                return content
+            api_kwargs["max_tokens"] = next_budget
+            retrying_truncation = True
+            continue
+
+        retrying_truncation = False
         if isinstance(content, str) and content.strip():
             break
 
-        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        empty_attempts += 1
         logger.warning(
             "VLM returned empty content for model=%r (attempt %d/%d, finish_reason=%r)",
             model_name,
-            attempt,
+            empty_attempts,
             _empty_response_max_attempts,
             finish_reason,
         )
-        if attempt < _empty_response_max_attempts:
-            await asyncio.sleep(min(0.5 * attempt, 2.0))
-    else:
-        logger.error(
-            "VLM returned empty content after %d attempts for model=%r; "
-            "returning no content to the caller's context-specific validator",
-            _empty_response_max_attempts,
-            model_name,
-        )
-        return None
+        if empty_attempts >= _empty_response_max_attempts:
+            logger.error(
+                "VLM returned empty content after %d attempts for model=%r; "
+                "returning no content to the caller's context-specific validator",
+                _empty_response_max_attempts,
+                model_name,
+            )
+            return None
+        await asyncio.sleep(min(0.5 * empty_attempts, 2.0))
 
     if hashing_kv is not None and use_cache:
         await hashing_kv.upsert(
@@ -218,6 +287,13 @@ def get_videorag() -> VideoRAG:
     global _videorag
     if _videorag is not None:
         return _videorag
+    # Publish only a completely initialized instance. A failed caption load
+    # must not leave an apparently ready singleton for a subsequent request.
+    _videorag = _create_videorag()
+    return _videorag
+
+
+def _create_videorag(caption_source=None) -> VideoRAG:
 
     vllm_config = LLMConfig(
         embedding_func_raw=_vllm_embedding,
@@ -238,7 +314,7 @@ def get_videorag() -> VideoRAG:
     )
 
     os.makedirs(_working_dir, exist_ok=True)
-    _videorag = VideoRAG(
+    vr = VideoRAG(
         llm=vllm_config,
         working_dir=_working_dir,
         video_segment_length=_segment_length,
@@ -246,11 +322,16 @@ def get_videorag() -> VideoRAG:
         multiple_choice_response_max_attempts=_mc_response_max_attempts,
     )
 
-    if _load_caption:
+    if caption_source is not None:
+        # Reload indexes and fresh LLM wrappers, not a second GPU copy of MiniCPM.
+        vr.caption_model = caption_source.caption_model
+        vr.caption_tokenizer = caption_source.caption_tokenizer
+        vr.caption_model_path = caption_source.caption_model_path
+    elif _load_caption:
         logger.info("Loading full MiniCPM caption model...")
-        _videorag.load_caption_model(debug=False)
+        vr.load_caption_model(debug=False)
     else:
-        _videorag.load_caption_model(debug=True)
+        vr.load_caption_model(debug=True)
 
     try:
         import decord
@@ -261,7 +342,31 @@ def get_videorag() -> VideoRAG:
     logger.info(
         f"VideoRAG initialized. working_dir='{_working_dir}', vlm='{_vlm_model}', embed='{_embed_model}'"
     )
-    return _videorag
+    return vr
+
+
+def _recover_failed_insertion(vr, original_error):
+    """Called under _pipeline_lock; never clear the error and reuse dirty state."""
+    global _videorag, _fatal_pipeline_error
+    try:
+        drain_pipeline_tasks(always_get_an_event_loop())
+        if isinstance(original_error, UnsafeVideoRAGState):
+            raise original_error
+        # Default local stores persist index changes only at _insert_done().
+        # That method flags partial commits as unsafe. Before commit, discard
+        # all in-memory mutations and reopen the last successfully saved indexes.
+        restored = _create_videorag(caption_source=vr)
+    except Exception as recovery_error:
+        _videorag = None
+        _fatal_pipeline_error = (
+            f"{type(original_error).__name__}: {original_error}; recovery unsafe/failed: "
+            f"{type(recovery_error).__name__}: {recovery_error}"
+        )
+        logger.exception("Cannot safely recover VideoRAG; further index access is blocked")
+    else:
+        _videorag = restored
+        _fatal_pipeline_error = None
+        logger.warning("Discarded failed insertion and reloaded committed VideoRAG indexes; later requests may continue")
 
 
 # ---------------------------------------------------------------------------
@@ -275,13 +380,14 @@ async def run_videorag_query(
     video_path: str,
     question: str,
     mode: str = "videorag_multiple_choice",
+    generation_kwargs: dict | None = None,
+    return_raw_response: bool = False,
 ) -> str:
     """
     Run VideoRAG retrieval-augmented video QA for a (video, question) pair.
     """
     query_mode = mode or _default_mode
     video_name = os.path.basename(video_path).split(".")[0]
-    vr = get_videorag()
 
     def _configure_decord():
         try:
@@ -290,7 +396,7 @@ async def run_videorag_query(
         except Exception:
             pass
 
-    def _insert_video_if_needed():
+    def _insert_video_if_needed(vr):
         if video_name not in vr.video_segments._data:
             cache_dir = os.path.join(vr.working_dir, "_cache", video_name)
             if os.path.exists(cache_dir):
@@ -303,12 +409,19 @@ async def run_videorag_query(
         else:
             logger.info(f"Video already ingested: {video_name}")
 
-    def _query_video():
-        param = QueryParam(mode=query_mode)
+    def _query_video(vr):
+        param = QueryParam(
+            mode=query_mode,
+            generation_kwargs=dict(generation_kwargs or {}),
+            return_raw_response=return_raw_response,
+        )
         param.wo_reference = True
 
         response = vr.query(query=question, param=param)
 
+        if return_raw_response:
+            # No answer extraction or empty-answer rejection in evaluation mode.
+            return response if isinstance(response, str) else ""
         if isinstance(response, dict):
             answer = response.get("Answer")
         else:
@@ -325,25 +438,43 @@ async def run_videorag_query(
         with _pipeline_lock:
             _configure_decord()
             if _fatal_pipeline_error is not None:
-                raise RuntimeError(
-                    "VideoRAG pipeline is halted after an earlier failure; restart "
-                    f"the MCP server. Original failure: {_fatal_pipeline_error}"
+                raise UnsafeVideoRAGState(
+                    "VideoRAG pipeline is halted because safe recovery failed; inspect "
+                    "worker cleanup and persisted indexes before restarting the MCP server. "
+                    f"Original failure: {_fatal_pipeline_error}"
                 )
+            # Resolve the singleton only after acquiring the lock: a queued
+            # request must not retain the failed instance from before recovery.
+            vr = get_videorag()
             try:
-                _insert_video_if_needed()
+                _insert_video_if_needed(vr)
             except Exception as exc:
-                # Insertion mutates several shared stores, so an unexpected
-                # insertion failure may leave in-memory state unsafe to reuse.
-                _fatal_pipeline_error = f"{type(exc).__name__}: {exc}"
+                _recover_failed_insertion(vr, exc)
+                if _fatal_pipeline_error is not None:
+                    raise UnsafeVideoRAGState(_fatal_pipeline_error) from exc
                 raise
             # Query/answer-format failures do not mutate the index. Let the
             # evaluator retry or fail this sample without poisoning later ones.
-            return _query_video()
+            try:
+                return _query_video(vr)
+            except Exception:
+                try:
+                    drain_pipeline_tasks(always_get_an_event_loop())
+                except Exception as cleanup_error:
+                    _fatal_pipeline_error = f"Query cleanup failed: {cleanup_error}"
+                    logger.exception("Cannot safely stop failed VideoRAG query tasks")
+                    raise UnsafeVideoRAGState(_fatal_pipeline_error) from cleanup_error
+                raise
 
     loop = asyncio.get_running_loop()
     try:
         answer = await loop.run_in_executor(None, _sync_process)
         return answer
+    except UnsafeVideoRAGState as exc:
+        logger.exception("Fatal VideoRAG pipeline failure; abort this evaluation")
+        # MCP masks ordinary exceptions. ToolError deliberately preserves this
+        # typed marker so the client can abort instead of grading 900 failures.
+        raise ToolError(f"{FATAL_ERROR_PREFIX} {exc}") from exc
     except Exception as exc:
         logger.exception("run_videorag_query failed")
         raise
